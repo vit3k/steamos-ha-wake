@@ -19,9 +19,21 @@ const POWER_KEYS: [u16; 3] = [116, 142, 143];
 /// `struct input_event` on 64-bit: timeval (16) + type (2) + code (2) + value (4).
 const INPUT_EVENT_SIZE: usize = 24;
 const VALVE_HID_ID: &str = "000028DE:";
-/// Steam Controller (2026) state report; bytes 2..10 are the button bitfield.
+/// Steam Controller (2026) state report. Bytes 2..6 are button and touch bits, 6..10 the
+/// analog triggers (a pull sets new bits too), 10..18 the sticks as four little-endian i16.
 const STEAM_STATE_REPORT: u8 = 0x42;
 const STEAM_BUTTONS: std::ops::Range<usize> = 2..10;
+const STEAM_STICKS: std::ops::Range<usize> = 10..18;
+/// Idle stick noise stays under ~1200; a deliberate move reaches ±32767.
+const STICK_THRESHOLD: i16 = 8000;
+/// A powered-on controller streams ~260 state reports/s. It goes silent when the PC suspends
+/// and stays silent after a Wake-on-LAN, apart from a burst of ~17 stale reports at resume.
+/// Silence followed by a sustained stream means someone turned the controller on. The stream
+/// must last a while: stale reports left in the hidraw buffer (up to 64) arrive all at once.
+const CONTROLLER_SILENCE: Duration = Duration::from_secs(2);
+const CONTROLLER_ON_REPORTS: u32 = 50;
+const CONTROLLER_ON_LASTING: Duration = Duration::from_millis(500);
+const CONTROLLER_ON_WITHIN: Duration = Duration::from_secs(2);
 
 /// Time and source of the latest physical press, shared between reader threads and waiters.
 #[derive(Default)]
@@ -150,20 +162,57 @@ fn read_evdev(mut f: File, dev: &Path, p: &Presence) {
     }
 }
 
+/// Time since boot including suspend. `Instant` stops while suspended, which would hide the
+/// controller's silence across a suspend.
+fn boottime() -> Duration {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: valid pointer to a timespec; CLOCK_BOOTTIME always exists on Linux.
+    unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
 fn read_steam(mut f: File, dev: &Path, p: &Presence) {
     let mut buf = [0u8; 256];
     let mut prev = [0u8; STEAM_BUTTONS.end - STEAM_BUTTONS.start];
+    let mut stick_was_out = false;
+    let mut last_report = boottime();
+    // Start and report count of a stream that began after silence.
+    let mut waking: Option<(Duration, u32)> = None;
     while let Ok(n) = f.read(&mut buf) {
         if n == 0 {
             return;
         }
-        if n < STEAM_BUTTONS.end || buf[0] != STEAM_STATE_REPORT {
+        let now = boottime();
+        if now - last_report > CONTROLLER_SILENCE {
+            waking = Some((now, 0));
+        }
+        last_report = now;
+        if n < STEAM_STICKS.end || buf[0] != STEAM_STATE_REPORT {
             continue;
         }
+
+        if let Some((start, count)) = &mut waking {
+            *count += 1;
+            if now - *start > CONTROLLER_ON_WITHIN {
+                waking = None;
+            } else if *count >= CONTROLLER_ON_REPORTS && now - *start >= CONTROLLER_ON_LASTING {
+                p.press(format!("{} controller turned on", dev.display()));
+                waking = None;
+            }
+        }
+
         let cur = &buf[STEAM_BUTTONS];
         if cur.iter().zip(prev).any(|(now, before)| now & !before != 0) {
             p.press(format!("{} buttons {:02x?} -> {:02x?}", dev.display(), prev, cur));
         }
         prev.copy_from_slice(cur);
+
+        let stick_out = buf[STEAM_STICKS]
+            .chunks_exact(2)
+            .any(|a| i16::from_le_bytes([a[0], a[1]]).saturating_abs() > STICK_THRESHOLD);
+        if stick_out && !stick_was_out {
+            p.press(format!("{} stick moved", dev.display()));
+        }
+        stick_was_out = stick_out;
     }
 }
