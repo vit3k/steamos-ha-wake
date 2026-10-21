@@ -6,3 +6,6 @@ webhook_url = "http://homeassistant.local:8123/api/webhook/CHANGE-ME"
 
 # Seconds to keep retrying the webhook.
 # retry_secs = 30
+
+# Log instead of calling the webhook (for testing).
+# dry_run = false

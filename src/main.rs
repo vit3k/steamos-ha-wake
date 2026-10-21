@@ -65,8 +65,8 @@ fn probe() -> Result<(), String> {
     println!("press something on a physical device within 120 s...");
     let p = Presence::watch();
     let start = Instant::now();
-    if p.wait_for_press(start, start + Duration::from_secs(120), &|| true) {
-        println!("Presence detected after {:.1?}", start.elapsed());
+    if let Some(source) = p.wait_for_press(start, start + Duration::from_secs(120), &|| true) {
+        println!("Presence detected after {:.1?}: {source}", start.elapsed());
     } else {
         println!("no Presence detected");
     }
@@ -152,14 +152,15 @@ fn first_start_this_boot() -> bool {
 fn handle_wake(kind: WakeKind, since: Instant, cfg: &Config, presence: &Presence, current: &dyn Fn() -> bool) {
     let kind_s = kind.as_str();
     log!("{kind_s}: waiting up to {:?} for Presence", cfg.presence);
-    if !presence.wait_for_press(since, Instant::now() + cfg.presence, current) {
+    let Some(source) = presence.wait_for_press(since, Instant::now() + cfg.presence, current) else {
         if current() {
             log!("{kind_s}: no Presence; treating as Remote Wake, not firing");
         } else {
             log!("{kind_s}: suspended again before Presence; abandoning");
         }
         return;
-    }
+    };
+    log!("{kind_s}: Presence from {source}");
     match punktfunk::Client::new().active_sessions() {
         Ok(0) => {}
         Ok(n) => {
@@ -174,6 +175,10 @@ fn handle_wake(kind: WakeKind, since: Instant, cfg: &Config, presence: &Presence
 
 /// POSTs the webhook, retrying with backoff until `cfg.retry` runs out.
 fn fire(kind: WakeKind, cfg: &Config, current: &dyn Fn() -> bool) {
+    if cfg.dry_run {
+        log!("dry_run: would POST {}", cfg.webhook_url);
+        return;
+    }
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(5)))
         .build()

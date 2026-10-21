@@ -13,6 +13,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const EV_KEY: u16 = 1;
+/// KEY_POWER, KEY_SLEEP, KEY_WAKEUP: power-state keys, not Presence. The ACPI power button
+/// device emits KEY_WAKEUP on every S3 resume, Wake-on-LAN included.
+const POWER_KEYS: [u16; 3] = [116, 142, 143];
 /// `struct input_event` on 64-bit: timeval (16) + type (2) + code (2) + value (4).
 const INPUT_EVENT_SIZE: usize = 24;
 const VALVE_HID_ID: &str = "000028DE:";
@@ -20,10 +23,10 @@ const VALVE_HID_ID: &str = "000028DE:";
 const STEAM_STATE_REPORT: u8 = 0x42;
 const STEAM_BUTTONS: std::ops::Range<usize> = 2..10;
 
-/// Time of the latest physical press, shared between reader threads and waiters.
+/// Time and source of the latest physical press, shared between reader threads and waiters.
 #[derive(Default)]
 pub struct Presence {
-    last: Mutex<Option<Instant>>,
+    last: Mutex<Option<(Instant, String)>>,
     cond: Condvar,
 }
 
@@ -36,22 +39,24 @@ impl Presence {
         p
     }
 
-    fn press(&self) {
-        *self.last.lock().unwrap() = Some(Instant::now());
+    fn press(&self, source: String) {
+        *self.last.lock().unwrap() = Some((Instant::now(), source));
         self.cond.notify_all();
     }
 
     /// Waits until a press newer than `since`, up to `deadline`, polling `keep_going` every second.
-    /// True if a press arrived.
-    pub fn wait_for_press(&self, since: Instant, deadline: Instant, keep_going: &dyn Fn() -> bool) -> bool {
+    /// The press's source, if one arrived.
+    pub fn wait_for_press(&self, since: Instant, deadline: Instant, keep_going: &dyn Fn() -> bool) -> Option<String> {
         let mut last = self.last.lock().unwrap();
         loop {
-            if last.is_some_and(|t| t > since) {
-                return true;
+            if let Some((t, source)) = &*last
+                && *t > since
+            {
+                return Some(source.clone());
             }
             let now = Instant::now();
             if now >= deadline || !keep_going() {
-                return false;
+                return None;
             }
             let wait = (deadline - now).min(Duration::from_secs(1));
             last = self.cond.wait_timeout(last, wait).unwrap().0;
@@ -72,8 +77,8 @@ fn scan_loop(p: Arc<Presence>) {
                     Ok(f) => {
                         crate::log!("watching {} ({kind:?})", dev.display());
                         match kind {
-                            Kind::Evdev => read_evdev(f, &p),
-                            Kind::SteamController => read_steam(f, &p),
+                            Kind::Evdev => read_evdev(f, &dev, &p),
+                            Kind::SteamController => read_steam(f, &dev, &p),
                         }
                     }
                     Err(e) => crate::log!("can't open {}: {e}", dev.display()),
@@ -127,23 +132,25 @@ fn is_valve(sys: &Path) -> bool {
     })
 }
 
-fn read_evdev(mut f: File, p: &Presence) {
+fn read_evdev(mut f: File, dev: &Path, p: &Presence) {
     let mut buf = [0u8; INPUT_EVENT_SIZE * 64];
     while let Ok(n) = f.read(&mut buf) {
         if n == 0 {
             return;
         }
         for ev in buf[..n].chunks_exact(INPUT_EVENT_SIZE) {
+            let secs = i64::from_ne_bytes(ev[0..8].try_into().unwrap());
             let kind = u16::from_ne_bytes([ev[16], ev[17]]);
+            let code = u16::from_ne_bytes([ev[18], ev[19]]);
             let value = i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]);
-            if kind == EV_KEY && value == 1 {
-                p.press();
+            if kind == EV_KEY && value == 1 && !POWER_KEYS.contains(&code) {
+                p.press(format!("{} key {code} (kernel time {secs})", dev.display()));
             }
         }
     }
 }
 
-fn read_steam(mut f: File, p: &Presence) {
+fn read_steam(mut f: File, dev: &Path, p: &Presence) {
     let mut buf = [0u8; 256];
     let mut prev = [0u8; STEAM_BUTTONS.end - STEAM_BUTTONS.start];
     while let Ok(n) = f.read(&mut buf) {
@@ -155,7 +162,7 @@ fn read_steam(mut f: File, p: &Presence) {
         }
         let cur = &buf[STEAM_BUTTONS];
         if cur.iter().zip(prev).any(|(now, before)| now & !before != 0) {
-            p.press();
+            p.press(format!("{} buttons {:02x?} -> {:02x?}", dev.display(), prev, cur));
         }
         prev.copy_from_slice(cur);
     }

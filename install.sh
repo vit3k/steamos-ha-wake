@@ -8,7 +8,8 @@ cargo build --release --target x86_64-unknown-linux-musl
 bin=target/x86_64-unknown-linux-musl/release/steamos-ha-wake
 
 ssh "$host" 'mkdir -p ~/.local/bin ~/.config/systemd/user ~/.config/steamos-ha-wake'
-scp "$bin" "$host:.local/bin/steamos-ha-wake"
+scp "$bin" "$host:.local/bin/steamos-ha-wake.new"
+ssh "$host" 'mv ~/.local/bin/steamos-ha-wake.new ~/.local/bin/steamos-ha-wake'
 scp dist/steamos-ha-wake.service "$host:.config/systemd/user/"
 ssh "$host" '[ -e ~/.config/steamos-ha-wake/config.toml ]' \
   || scp dist/config.example.toml "$host:.config/steamos-ha-wake/config.toml"
