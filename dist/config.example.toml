@@ -1,0 +1,11 @@
+# Home Assistant webhook trigger URL.
+webhook_url = "http://homeassistant.local:8123/api/webhook/CHANGE-ME"
+
+# Seconds to watch for a punktfunk session after a Wake before firing.
+# grace_secs = 20
+
+# Seconds to keep retrying the webhook.
+# retry_secs = 30
+
+# Interface whose Wake-on-LAN wakeups mean Remote Wake. Default: every wake-enabled interface.
+# interface = "enp3s0"

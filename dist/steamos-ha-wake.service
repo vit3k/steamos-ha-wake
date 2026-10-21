@@ -1,0 +1,10 @@
+[Unit]
+Description=Fire Home Assistant Wake Trigger on local boot/resume
+
+[Service]
+ExecStart=%h/.local/bin/steamos-ha-wake run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
