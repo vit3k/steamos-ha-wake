@@ -1,18 +1,23 @@
-//! Fires a Home Assistant webhook (the Wake Trigger) on a Local Wake: a boot, or a resume
-//! from suspend that wasn't caused by Wake-on-LAN or a punktfunk streaming client.
+//! Fires a Home Assistant webhook (the Wake Trigger) on a Local Wake: a boot or resume
+//! followed by Presence (a press on a physical input device) while no punktfunk session runs.
 //! See GLOSSARY.md and docs/adr/0001-remote-wake-detection.md.
 
+macro_rules! log {
+    ($($t:tt)*) => { eprintln!($($t)*) };
+}
+pub(crate) use log;
+
 mod config;
-mod nic;
+mod presence;
 mod punktfunk;
 
 use config::Config;
+use presence::Presence;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use zbus::blocking::{Connection, Proxy};
-use zbus::zvariant::OwnedFd;
 
 #[derive(Debug, Clone, Copy)]
 enum WakeKind {
@@ -29,10 +34,6 @@ impl WakeKind {
     }
 }
 
-macro_rules! log {
-    ($($t:tt)*) => { eprintln!($($t)*) };
-}
-
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_else(|| "run".into());
     let result = match cmd.as_str() {
@@ -46,37 +47,36 @@ fn main() {
     }
 }
 
-/// Print what the daemon would see, for checking a new machine.
+/// Print what the daemon would see, then report physical presses for 120 s.
 fn probe() -> Result<(), String> {
     println!("config: {}", config::path().display());
-    let cfg = config::load();
-    match &cfg {
+    match config::load() {
         Ok(c) => println!("  ok: {c:?}"),
         Err(e) => println!("  error: {e}"),
     }
-    let configured = cfg.as_ref().ok().and_then(|c| c.interface.as_deref());
-    println!("wake-capable interfaces: {:?}", nic::wake_capable());
-    for i in nic::watched(configured) {
-        println!("  {i}: wakeup_count = {:?}", nic::wakeup_count(&i));
-    }
-    match std::fs::read_to_string("/sys/power/pm_wakeup_irq") {
-        Ok(irq) => println!("last wakeup irq: {}", irq.trim()),
-        Err(e) => println!("last wakeup irq: unavailable ({e})"),
+    println!("input devices counted as Presence:");
+    for (dev, kind) in presence::candidates() {
+        println!("  {} ({kind:?})", dev.display());
     }
     match punktfunk::Client::new().active_sessions() {
         Ok(n) => println!("punktfunk active_sessions: {n}"),
         Err(e) => println!("punktfunk: unreachable ({e})"),
     }
+    println!("press something on a physical device within 120 s...");
+    let p = Presence::watch();
+    let start = Instant::now();
+    if p.wait_for_press(start, start + Duration::from_secs(120), &|| true) {
+        println!("Presence detected after {:.1?}", start.elapsed());
+    } else {
+        println!("no Presence detected");
+    }
     Ok(())
 }
 
 fn run() -> Result<(), String> {
+    let started = Instant::now();
     let cfg = Arc::new(config::load()?);
-    let ifaces = nic::watched(cfg.interface.as_deref());
-    log!("watching wake sources: {ifaces:?}");
-    if ifaces.is_empty() {
-        log!("warning: no wake-capable interface; Wake-on-LAN can't be detected, only punktfunk sessions");
-    }
+    let presence = Presence::watch();
 
     let conn = Connection::system().map_err(|e| format!("system bus: {e}"))?;
     let logind = Proxy::new(
@@ -93,15 +93,22 @@ fn run() -> Result<(), String> {
 
     // Bumped on every suspend so an in-flight wake handler stops.
     let generation = Arc::new(AtomicU64::new(0));
+    let spawn = |kind, since| {
+        let (cfg, presence, generation) = (cfg.clone(), presence.clone(), generation.clone());
+        let my_gen = generation.load(Ordering::SeqCst);
+        thread::spawn(move || {
+            let current = || generation.load(Ordering::SeqCst) == my_gen;
+            handle_wake(kind, since, &cfg, &presence, &current);
+        });
+    };
 
     if first_start_this_boot() {
-        spawn_handler(WakeKind::Boot, None, cfg.clone(), generation.clone());
+        spawn(WakeKind::Boot, started);
     } else {
         log!("already handled this boot; not firing (daemon restart or re-login)");
     }
 
-    let mut inhibitor = inhibit(&logind);
-    let mut snapshot = None;
+    let mut suspended_at = started;
     for msg in signals {
         let going_down: bool = match msg.body().deserialize() {
             Ok(b) => b,
@@ -112,25 +119,14 @@ fn run() -> Result<(), String> {
         };
         if going_down {
             generation.fetch_add(1, Ordering::SeqCst);
-            snapshot = Some(nic::Snapshot::take(&ifaces));
-            log!("suspending; snapshot {snapshot:?}");
-            // Snapshot taken: let the suspend proceed.
-            drop(inhibitor.take());
+            suspended_at = Instant::now();
+            log!("suspending");
         } else {
             log!("resumed");
-            spawn_handler(WakeKind::Resume, snapshot.take(), cfg.clone(), generation.clone());
-            inhibitor = inhibit(&logind);
+            spawn(WakeKind::Resume, suspended_at);
         }
     }
     Err("PrepareForSleep signal stream ended".into())
-}
-
-/// Takes a logind delay inhibitor so the pre-suspend snapshot happens before the system sleeps.
-fn inhibit(logind: &Proxy) -> Option<OwnedFd> {
-    logind
-        .call("Inhibit", &("sleep", "steamos-ha-wake", "Record wake sources before suspend", "delay"))
-        .inspect_err(|e| log!("warning: no sleep inhibitor ({e}); wake source snapshot may race suspend"))
-        .ok()
 }
 
 /// True once per kernel boot, so a daemon restart or re-login doesn't count as a Wake.
@@ -152,52 +148,26 @@ fn first_start_this_boot() -> bool {
     true
 }
 
-fn spawn_handler(kind: WakeKind, snapshot: Option<nic::Snapshot>, cfg: Arc<Config>, generation: Arc<AtomicU64>) {
-    let my_gen = generation.load(Ordering::SeqCst);
-    thread::spawn(move || {
-        let current = || generation.load(Ordering::SeqCst) == my_gen;
-        handle_wake(kind, snapshot, &cfg, &current);
-    });
-}
-
-fn handle_wake(kind: WakeKind, snapshot: Option<nic::Snapshot>, cfg: &Config, current: &dyn Fn() -> bool) {
+/// `since`: presses before this instant (e.g. the one that put the box to sleep) don't count.
+fn handle_wake(kind: WakeKind, since: Instant, cfg: &Config, presence: &Presence, current: &dyn Fn() -> bool) {
     let kind_s = kind.as_str();
-
-    if let WakeKind::Resume = kind {
-        match &snapshot {
-            Some(s) => {
-                if let Some(iface) = s.woke_by() {
-                    log!("{kind_s}: Remote Wake (Wake-on-LAN via {iface}); not firing");
-                    return;
-                }
-            }
-            None => log!("{kind_s}: no pre-suspend snapshot; skipping Wake-on-LAN check"),
+    log!("{kind_s}: waiting up to {:?} for Presence", cfg.presence);
+    if !presence.wait_for_press(since, Instant::now() + cfg.presence, current) {
+        if current() {
+            log!("{kind_s}: no Presence; treating as Remote Wake, not firing");
+        } else {
+            log!("{kind_s}: suspended again before Presence; abandoning");
         }
+        return;
     }
-
-    // Grace window: a streaming client connecting now means this was a Remote Wake.
-    let pf = punktfunk::Client::new();
-    let deadline = Instant::now() + cfg.grace;
-    let mut last_err = None;
-    while Instant::now() < deadline {
-        if !current() {
-            log!("{kind_s}: suspended again during grace window; abandoning");
+    match punktfunk::Client::new().active_sessions() {
+        Ok(0) => {}
+        Ok(n) => {
+            log!("{kind_s}: Presence, but punktfunk has {n} active session(s); not firing");
             return;
         }
-        match pf.active_sessions() {
-            Ok(0) => last_err = None,
-            Ok(n) => {
-                log!("{kind_s}: Remote Wake (punktfunk has {n} active session(s)); not firing");
-                return;
-            }
-            Err(e) => last_err = Some(e),
-        }
-        thread::sleep(Duration::from_secs(1));
+        Err(e) => log!("{kind_s}: punktfunk unreachable ({e}); treating as no session"),
     }
-    if let Some(e) = last_err {
-        log!("{kind_s}: punktfunk unreachable at end of grace window ({e}); treating as no session");
-    }
-
     log!("{kind_s}: Local Wake; firing Wake Trigger");
     fire(kind, cfg, current);
 }

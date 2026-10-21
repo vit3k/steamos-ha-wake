@@ -11,3 +11,6 @@ A Wake started from elsewhere: a Wake-on-LAN packet, a streaming client (e.g. pu
 
 **Wake Trigger**
 The Home Assistant automation fired on a Local Wake. Turns on living-room media gear. Never fired on a Remote Wake; when the kind of Wake is uncertain, it is not fired.
+
+**Presence**
+Evidence that someone is physically at the machine: a press on a real keyboard, mouse, power button or controller. Input arriving over a streaming session is not Presence. A Wake followed by Presence is treated as a Local Wake.

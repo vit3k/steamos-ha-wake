@@ -1,24 +1,31 @@
-# 1. Detect Remote Wake by NIC wake source plus a streaming grace window
+# 1. Detect Local Wake by physical input, not by wake source
 
 ## Status
 
-Accepted
+Accepted. Supersedes the first version of this ADR (NIC wake source plus a punktfunk grace window).
 
 ## Context
 
-The Wake Trigger must fire on a Local Wake and never on a Remote Wake. When unsure, it must not fire. A Remote Wake comes in two forms: a plain Wake-on-LAN packet (from HA, a phone app, etc.) and a punktfunk client, which sends WoL every 6 s for up to 90 s and then connects. Kernel wake-source accounting (`wakeup_count` per device) can identify a NIC wake, but on AMD s2idle several sources can share one IRQ, so it may be unreliable.
+The Wake Trigger must fire on a Local Wake and never on a Remote Wake. When unsure, it must not fire.
+
+The first design tried to identify a Remote Wake from the kernel's wake-source accounting (the network card's `wakeup_count`). On the target box this is useless. It sleeps in ACPI S3 (`mem_sleep = deep`), where the firmware handles the wake and the kernel credits no device: after a confirmed Wake-on-LAN resume every `wakeup_count` was still 0, and the only counters that moved (USB controller, `gpe6D`) move on every resume. A Remote Wake can't be told from a Local one by how the machine woke.
 
 ## Decision
 
-Two checks, both must pass to fire:
+Look for Presence instead: someone physically at the machine.
 
-1. After resume, if the network card's `wakeup_count` increased across the suspend, treat it as a Remote Wake and skip.
-2. Otherwise wait a grace window (20 s), polling the punktfunk management API (`GET /api/v1/status`). If `active_sessions > 0` at any point, skip. Else fire. If the API is unreachable for the whole window, fire: no client could have connected.
+1. After a Wake, wait up to 120 s for a press on a physical input device:
+   - evdev devices not under `/devices/virtual/` (keyboard, mouse, power button), key presses only;
+   - the Steam Controller (2026) through its Puck's hidraw nodes, because Steam owns the controller and its evdev devices stay silent. A press is a newly set bit in bytes 2–9 of input report `0x42`.
+2. On the first press, if punktfunk reports an active session, skip. Otherwise fire.
+3. No press within the window: no fire.
 
-A boot from fully off skips check 1 because the machine is never woken remotely from off.
+Virtual devices (punktfunk's and Steam Input's virtual pads) never count, so remote input can't fake Presence.
 
 ## Consequences
 
-- A Local Wake fires late, by the length of the grace window.
-- A Local Wake followed right away by a punktfunk connection from another device is treated as remote. This is acceptable, since a missed fire is better than a false one.
-- Alternatives rejected: grace window only (a plain WoL would fire); NIC check only (unreliable IRQ attribution, and blind to some streaming starts).
+- Every kind of Remote Wake is covered (plain WoL, punktfunk, anything else) without depending on how the machine woke.
+- A Local Wake fires on the first press, not after a fixed delay.
+- Waking the box and touching nothing never fires. Accepted: a missed fire beats a false one.
+- The Steam Controller report layout is reverse-engineered from one capture; a firmware change could move the button bits.
+- Rejected: NIC wake source (no attribution in S3); punktfunk-only (plain WoL fires); switching to s2idle (system change, higher sleep power, attribution still unproven).

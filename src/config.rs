@@ -6,20 +6,17 @@ use std::time::Duration;
 #[serde(deny_unknown_fields)]
 struct File {
     webhook_url: String,
-    grace_secs: Option<u64>,
+    presence_secs: Option<u64>,
     retry_secs: Option<u64>,
-    interface: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub webhook_url: String,
-    /// How long to watch for a punktfunk session before firing.
-    pub grace: Duration,
+    /// How long after a Wake a physical press still counts as Presence.
+    pub presence: Duration,
     /// How long to keep retrying the webhook before giving up.
     pub retry: Duration,
-    /// Network interface whose wake source identifies a Wake-on-LAN. `None` = auto-detect.
-    pub interface: Option<String>,
 }
 
 pub fn home() -> PathBuf {
@@ -39,8 +36,7 @@ pub fn load() -> Result<Config, String> {
     let f: File = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(Config {
         webhook_url: f.webhook_url,
-        grace: Duration::from_secs(f.grace_secs.unwrap_or(20)),
+        presence: Duration::from_secs(f.presence_secs.unwrap_or(120)),
         retry: Duration::from_secs(f.retry_secs.unwrap_or(30)),
-        interface: f.interface,
     })
 }
