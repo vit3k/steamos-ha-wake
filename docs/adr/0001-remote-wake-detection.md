@@ -13,7 +13,7 @@ The Wake Trigger must fire on a Local Wake and never on a Remote Wake. When unsu
 Two checks, both must pass to fire:
 
 1. After resume, if the network card's `wakeup_count` increased across the suspend, treat it as a Remote Wake and skip.
-2. Otherwise wait a grace window. If punktfunk reports `client.connected` (through its hooks) during that window, skip. Else fire.
+2. Otherwise wait a grace window (20 s), polling the punktfunk management API (`GET /api/v1/status`). If `active_sessions > 0` at any point, skip. Else fire. If the API is unreachable for the whole window, fire: no client could have connected.
 
 A boot from fully off skips check 1 because the machine is never woken remotely from off.
 
