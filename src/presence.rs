@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,6 +27,8 @@ const STEAM_BUTTONS: std::ops::Range<usize> = 2..10;
 const STEAM_STICKS: std::ops::Range<usize> = 10..18;
 /// Idle stick noise stays under ~1200; a deliberate move reaches ±32767.
 const STICK_THRESHOLD: i16 = 8000;
+/// The Steam button: bit 0x01 of report byte 4.
+const STEAM_BUTTON: (usize, u8) = (4, 0x01);
 /// A powered-on controller streams ~260 state reports/s. It goes silent when the PC suspends
 /// and stays silent after a Wake-on-LAN, apart from a burst of ~17 stale reports at resume.
 /// Silence followed by a sustained stream means someone turned the controller on. The stream
@@ -36,16 +39,18 @@ const CONTROLLER_ON_LASTING: Duration = Duration::from_millis(500);
 const CONTROLLER_ON_WITHIN: Duration = Duration::from_secs(2);
 
 /// Time and source of the latest physical press, shared between reader threads and waiters.
-#[derive(Default)]
 pub struct Presence {
     last: Mutex<Option<(Instant, String)>>,
     cond: Condvar,
+    /// Receives the source of each Steam button press (or the controller turning on, which
+    /// is done with the Steam button).
+    steam_button: Option<Sender<String>>,
 }
 
 impl Presence {
     /// Starts watching input devices in the background; new devices are picked up as they appear.
-    pub fn watch() -> Arc<Self> {
-        let p = Arc::new(Presence::default());
+    pub fn watch(steam_button: Option<Sender<String>>) -> Arc<Self> {
+        let p = Arc::new(Presence { last: Mutex::new(None), cond: Condvar::new(), steam_button });
         let p2 = p.clone();
         thread::spawn(move || scan_loop(p2));
         p
@@ -54,6 +59,12 @@ impl Presence {
     fn press(&self, source: String) {
         *self.last.lock().unwrap() = Some((Instant::now(), source));
         self.cond.notify_all();
+    }
+
+    fn steam_button(&self, source: String) {
+        if let Some(tx) = &self.steam_button {
+            let _ = tx.send(source);
+        }
     }
 
     /// Waits until a press newer than `since`, up to `deadline`, polling `keep_going` every second.
@@ -164,7 +175,7 @@ fn read_evdev(mut f: File, dev: &Path, p: &Presence) {
 
 /// Time since boot including suspend. `Instant` stops while suspended, which would hide the
 /// controller's silence across a suspend.
-fn boottime() -> Duration {
+pub fn boottime() -> Duration {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: valid pointer to a timespec; CLOCK_BOOTTIME always exists on Linux.
     unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
@@ -197,6 +208,7 @@ fn read_steam(mut f: File, dev: &Path, p: &Presence) {
                 waking = None;
             } else if *count >= CONTROLLER_ON_REPORTS && now - *start >= CONTROLLER_ON_LASTING {
                 p.press(format!("{} controller turned on", dev.display()));
+                p.steam_button(format!("{} controller turned on", dev.display()));
                 waking = None;
             }
         }
@@ -204,6 +216,11 @@ fn read_steam(mut f: File, dev: &Path, p: &Presence) {
         let cur = &buf[STEAM_BUTTONS];
         if cur.iter().zip(prev).any(|(now, before)| now & !before != 0) {
             p.press(format!("{} buttons {:02x?} -> {:02x?}", dev.display(), prev, cur));
+        }
+        let (byte, bit) = STEAM_BUTTON;
+        let steam_bit = |b: &[u8]| b[byte - STEAM_BUTTONS.start] & bit != 0;
+        if steam_bit(cur) && !steam_bit(&prev) {
+            p.steam_button(format!("{} Steam button", dev.display()));
         }
         prev.copy_from_slice(cur);
 

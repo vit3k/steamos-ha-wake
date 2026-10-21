@@ -1,5 +1,6 @@
 //! Fires a Home Assistant webhook (the Wake Trigger) on a Local Wake: a boot or resume
 //! followed by Presence (a press on a physical input device) while no punktfunk session runs.
+//! Also fires on any Steam button press. At most once per cooldown.
 //! See GLOSSARY.md and docs/adr/0001-remote-wake-detection.md.
 
 macro_rules! log {
@@ -13,25 +14,44 @@ mod punktfunk;
 
 use config::Config;
 use presence::Presence;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use zbus::blocking::{Connection, Proxy};
 
+/// Fires of the Wake Trigger closer together than this are dropped.
+const COOLDOWN: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Copy)]
-enum WakeKind {
+enum Reason {
     Boot,
     Resume,
+    SteamButton,
 }
 
-impl WakeKind {
+impl Reason {
     fn as_str(self) -> &'static str {
         match self {
-            WakeKind::Boot => "boot",
-            WakeKind::Resume => "resume",
+            Reason::Boot => "boot",
+            Reason::Resume => "resume",
+            Reason::SteamButton => "steam_button",
         }
     }
+}
+
+/// Boot time (including suspend) of the last fire, shared by all firing paths.
+type LastFire = Arc<Mutex<Option<Duration>>>;
+
+/// Claims the cooldown slot; false if a fire happened less than `COOLDOWN` ago.
+fn claim_cooldown(last_fire: &LastFire) -> bool {
+    let now = presence::boottime();
+    let mut last = last_fire.lock().unwrap();
+    if last.is_some_and(|t| now - t < COOLDOWN) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 fn main() {
@@ -63,7 +83,7 @@ fn probe() -> Result<(), String> {
         Err(e) => println!("punktfunk: unreachable ({e})"),
     }
     println!("press something on a physical device within 120 s...");
-    let p = Presence::watch();
+    let p = Presence::watch(None);
     let start = Instant::now();
     if let Some(source) = p.wait_for_press(start, start + Duration::from_secs(120), &|| true) {
         println!("Presence detected after {:.1?}: {source}", start.elapsed());
@@ -76,7 +96,19 @@ fn probe() -> Result<(), String> {
 fn run() -> Result<(), String> {
     let started = Instant::now();
     let cfg = Arc::new(config::load()?);
-    let presence = Presence::watch();
+    let last_fire: LastFire = Arc::default();
+    let (steam_tx, steam_rx) = mpsc::channel::<String>();
+    let presence = Presence::watch(Some(steam_tx));
+
+    {
+        let (cfg, last_fire) = (cfg.clone(), last_fire.clone());
+        thread::spawn(move || {
+            for source in steam_rx {
+                log!("{source}");
+                fire(Reason::SteamButton, &cfg, &last_fire, &|| true);
+            }
+        });
+    }
 
     let conn = Connection::system().map_err(|e| format!("system bus: {e}"))?;
     let logind = Proxy::new(
@@ -95,15 +127,16 @@ fn run() -> Result<(), String> {
     let generation = Arc::new(AtomicU64::new(0));
     let spawn = |kind, since| {
         let (cfg, presence, generation) = (cfg.clone(), presence.clone(), generation.clone());
+        let last_fire = last_fire.clone();
         let my_gen = generation.load(Ordering::SeqCst);
         thread::spawn(move || {
             let current = || generation.load(Ordering::SeqCst) == my_gen;
-            handle_wake(kind, since, &cfg, &presence, &current);
+            handle_wake(kind, since, &cfg, &presence, &last_fire, &current);
         });
     };
 
     if first_start_this_boot() {
-        spawn(WakeKind::Boot, started);
+        spawn(Reason::Boot, started);
     } else {
         log!("already handled this boot; not firing (daemon restart or re-login)");
     }
@@ -123,7 +156,7 @@ fn run() -> Result<(), String> {
             log!("suspending");
         } else {
             log!("resumed");
-            spawn(WakeKind::Resume, suspended_at);
+            spawn(Reason::Resume, suspended_at);
         }
     }
     Err("PrepareForSleep signal stream ended".into())
@@ -149,7 +182,14 @@ fn first_start_this_boot() -> bool {
 }
 
 /// `since`: presses before this instant (e.g. the one that put the box to sleep) don't count.
-fn handle_wake(kind: WakeKind, since: Instant, cfg: &Config, presence: &Presence, current: &dyn Fn() -> bool) {
+fn handle_wake(
+    kind: Reason,
+    since: Instant,
+    cfg: &Config,
+    presence: &Presence,
+    last_fire: &LastFire,
+    current: &dyn Fn() -> bool,
+) {
     let kind_s = kind.as_str();
     log!("{kind_s}: waiting up to {:?} for Presence", cfg.presence);
     let Some(source) = presence.wait_for_press(since, Instant::now() + cfg.presence, current) else {
@@ -169,12 +209,17 @@ fn handle_wake(kind: WakeKind, since: Instant, cfg: &Config, presence: &Presence
         }
         Err(e) => log!("{kind_s}: punktfunk unreachable ({e}); treating as no session"),
     }
-    log!("{kind_s}: Local Wake; firing Wake Trigger");
-    fire(kind, cfg, current);
+    log!("{kind_s}: Local Wake");
+    fire(kind, cfg, last_fire, current);
 }
 
-/// POSTs the webhook, retrying with backoff until `cfg.retry` runs out.
-fn fire(kind: WakeKind, cfg: &Config, current: &dyn Fn() -> bool) {
+/// POSTs the webhook, retrying with backoff until `cfg.retry` runs out. Skipped during the cooldown.
+fn fire(reason: Reason, cfg: &Config, last_fire: &LastFire, current: &dyn Fn() -> bool) {
+    if !claim_cooldown(last_fire) {
+        log!("{}: within {COOLDOWN:?} of the last fire; not firing again", reason.as_str());
+        return;
+    }
+    log!("{}: firing Wake Trigger", reason.as_str());
     if cfg.dry_run {
         log!("dry_run: would POST {}", cfg.webhook_url);
         return;
@@ -190,7 +235,7 @@ fn fire(kind: WakeKind, cfg: &Config, current: &dyn Fn() -> bool) {
             log!("suspended again before webhook succeeded; abandoning");
             return;
         }
-        match agent.post(&cfg.webhook_url).send_json(serde_json::json!({ "wake": kind.as_str() })) {
+        match agent.post(&cfg.webhook_url).send_json(serde_json::json!({ "reason": reason.as_str() })) {
             Ok(_) => {
                 log!("Wake Trigger fired");
                 return;
