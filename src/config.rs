@@ -6,6 +6,7 @@ use std::time::Duration;
 #[serde(deny_unknown_fields)]
 struct File {
     webhook_url: String,
+    suspend_webhook_url: Option<String>,
     presence_secs: Option<u64>,
     retry_secs: Option<u64>,
     dry_run: Option<bool>,
@@ -14,6 +15,8 @@ struct File {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub webhook_url: String,
+    /// Called before every suspend, if set.
+    pub suspend_webhook_url: Option<String>,
     /// How long after a Wake a physical press still counts as Presence.
     pub presence: Duration,
     /// How long to keep retrying the webhook before giving up.
@@ -39,6 +42,7 @@ pub fn load() -> Result<Config, String> {
     let f: File = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(Config {
         webhook_url: f.webhook_url,
+        suspend_webhook_url: f.suspend_webhook_url,
         presence: Duration::from_secs(f.presence_secs.unwrap_or(120)),
         retry: Duration::from_secs(f.retry_secs.unwrap_or(30)),
         dry_run: f.dry_run.unwrap_or(false),

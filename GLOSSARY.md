@@ -14,3 +14,6 @@ The Home Assistant automation that turns on living-room media gear. Fired on a L
 
 **Presence**
 Evidence that someone is physically at the machine: a press on a real keyboard, mouse or controller, or the controller being turned on. Input arriving over a streaming session is not Presence. A Wake followed by Presence is treated as a Local Wake.
+
+**Suspend Trigger**
+The Home Assistant automation called just before every suspend (e.g. turning media gear off). Separate from the Wake Trigger. Fired on every suspend, whoever woke the machine.

@@ -1,6 +1,7 @@
 //! Fires a Home Assistant webhook (the Wake Trigger) on a Local Wake: a boot or resume
 //! followed by Presence (a press on a physical input device) while no punktfunk session runs.
 //! Also fires on any Steam button press. At most once per cooldown.
+//! Separately, calls the suspend webhook (if configured) before every suspend.
 //! See GLOSSARY.md and docs/adr/0001-remote-wake-detection.md.
 
 macro_rules! log {
@@ -19,9 +20,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use zbus::blocking::{Connection, Proxy};
+use zbus::zvariant::OwnedFd;
 
 /// Fires of the Wake Trigger closer together than this are dropped.
 const COOLDOWN: Duration = Duration::from_secs(60);
+/// Suspend waits for the suspend webhook at most this long. logind's default cap on a delay
+/// inhibitor is 5 s.
+const SUSPEND_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy)]
 enum Reason {
@@ -141,6 +146,8 @@ fn run() -> Result<(), String> {
         log!("already handled this boot; not firing (daemon restart or re-login)");
     }
 
+    // Holds back suspend until the suspend webhook has been called.
+    let mut inhibitor = cfg.suspend_webhook_url.as_ref().and_then(|_| inhibit(&logind));
     let mut suspended_at = started;
     for msg in signals {
         let going_down: bool = match msg.body().deserialize() {
@@ -154,12 +161,45 @@ fn run() -> Result<(), String> {
             generation.fetch_add(1, Ordering::SeqCst);
             suspended_at = Instant::now();
             log!("suspending");
+            if let Some(url) = &cfg.suspend_webhook_url {
+                fire_suspend(url, &cfg);
+            }
+            // The next turn-on must not be eaten by a cooldown from before this suspend.
+            *last_fire.lock().unwrap() = None;
+            drop(inhibitor.take());
         } else {
             log!("resumed");
+            if cfg.suspend_webhook_url.is_some() {
+                inhibitor = inhibit(&logind);
+            }
             spawn(Reason::Resume, suspended_at);
         }
     }
     Err("PrepareForSleep signal stream ended".into())
+}
+
+/// Takes a logind delay inhibitor so the suspend webhook goes out before the system sleeps.
+fn inhibit(logind: &Proxy) -> Option<OwnedFd> {
+    logind
+        .call("Inhibit", &("sleep", "steamos-ha-wake", "Calling the suspend webhook", "delay"))
+        .inspect_err(|e| log!("warning: no sleep inhibitor ({e}); suspend webhook may not get out"))
+        .ok()
+}
+
+/// One POST to the suspend webhook, bounded by `SUSPEND_TIMEOUT` because suspend is waiting.
+fn fire_suspend(url: &str, cfg: &Config) {
+    if cfg.dry_run {
+        log!("suspend: dry_run: would POST {url}");
+        return;
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(SUSPEND_TIMEOUT))
+        .build()
+        .into();
+    match agent.post(url).send_json(serde_json::json!({ "reason": "suspend" })) {
+        Ok(_) => log!("suspend: webhook called"),
+        Err(e) => log!("suspend: webhook failed ({e}); suspending anyway"),
+    }
 }
 
 /// True once per kernel boot, so a daemon restart or re-login doesn't count as a Wake.

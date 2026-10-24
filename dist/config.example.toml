@@ -1,6 +1,9 @@
 # Home Assistant webhook trigger URL.
 webhook_url = "http://homeassistant.local:8123/api/webhook/CHANGE-ME"
 
+# Home Assistant webhook called before every suspend (e.g. TV/AVR off). Optional.
+# suspend_webhook_url = "http://homeassistant.local:8123/api/webhook/CHANGE-ME-TOO"
+
 # Seconds after a Wake in which a physical press still counts as Presence.
 # presence_secs = 120
 
