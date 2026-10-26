@@ -13,7 +13,7 @@ A Wake started from elsewhere: a Wake-on-LAN packet, a streaming client (e.g. pu
 The Home Assistant automation that turns on living-room media gear. Fired on a Local Wake and on any press of the physical Steam button, at most once a minute. Never fired on a Remote Wake; when the kind of Wake is uncertain, it is not fired.
 
 **Presence**
-Evidence that someone is physically at the machine: a press on a real keyboard, mouse or controller, or the controller being turned on. Input arriving over a streaming session is not Presence. A Wake followed by Presence is treated as a Local Wake.
+Evidence that someone is physically at the machine: a press on a real keyboard, mouse or controller, or the controller starting to stream right after a Wake. Input arriving over a streaming session is not Presence. A Wake followed by Presence is treated as a Local Wake.
 
 **Suspend Trigger**
 The Home Assistant automation called just before every suspend (e.g. turning media gear off). Separate from the Wake Trigger. Fired on every suspend, whoever woke the machine.

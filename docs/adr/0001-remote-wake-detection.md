@@ -28,6 +28,6 @@ Virtual devices (punktfunk's and Steam Input's virtual pads) never count, so rem
 - Every kind of Remote Wake is covered (plain WoL, punktfunk, anything else) without depending on how the machine woke.
 - A Local Wake by the Steam Controller fires right at resume; by other devices, on the first press.
 - Waking the box with the power button or keyboard and touching nothing never fires. Accepted: a missed fire beats a false one.
-- Turning the controller on while the PC is already awake also counts as Presence, but only matters inside the window after a Wake.
+- Turning the controller on while the PC is already awake also counts as Presence, but only matters inside the window after a Wake. It is not treated as a Steam button press: an idle controller stops streaming after a while, and moving it (e.g. for gyro) restarts the stream the same way.
 - The Steam Controller report layout is reverse-engineered from one capture; a firmware change could move the button bits.
 - Rejected: NIC wake source (no attribution in S3); punktfunk-only (plain WoL fires); switching to s2idle (system change, higher sleep power, attribution still unproven).

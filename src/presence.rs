@@ -42,8 +42,7 @@ const CONTROLLER_ON_WITHIN: Duration = Duration::from_secs(2);
 pub struct Presence {
     last: Mutex<Option<(Instant, String)>>,
     cond: Condvar,
-    /// Receives the source of each Steam button press (or the controller turning on, which
-    /// is done with the Steam button).
+    /// Receives the source of each Steam button press.
     steam_button: Option<Sender<String>>,
 }
 
@@ -207,8 +206,9 @@ fn read_steam(mut f: File, dev: &Path, p: &Presence) {
             if now - *start > CONTROLLER_ON_WITHIN {
                 waking = None;
             } else if *count >= CONTROLLER_ON_REPORTS && now - *start >= CONTROLLER_ON_LASTING {
+                // Presence only: moving an idle controller can also restart its stream, so this
+                // is not proof of a Steam button press.
                 p.press(format!("{} controller turned on", dev.display()));
-                p.steam_button(format!("{} controller turned on", dev.display()));
                 waking = None;
             }
         }
